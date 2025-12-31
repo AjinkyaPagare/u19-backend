@@ -1,5 +1,5 @@
 # Flask imports - no monkey patching needed for threading mode
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import logging
 import os
@@ -11,6 +11,9 @@ app.config['SECRET_KEY'] = 'secret!'
 # Initialize SocketIO - auto-detect async mode
 socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interval=25)
 
+# Track rooms and their participants
+active_rooms = {}  # {room_code: {'senders': [sid1], 'receivers': [sid2]}}
+
 @app.route('/')
 def index():
     return jsonify({
@@ -20,33 +23,75 @@ def index():
 
 @socketio.on('connect')
 def handle_connect():
-    print('Client connected')
+    print(f'Client connected: {request.sid}')
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print('Client disconnected')
+    sid = request.sid
+    print(f'Client disconnected: {sid}')
+    
+    # Remove from all rooms
+    for room_code in list(active_rooms.keys()):
+        room = active_rooms[room_code]
+        if sid in room.get('senders', []):
+            room['senders'].remove(sid)
+        if sid in room.get('receivers', []):
+            room['receivers'].remove(sid)
+        
+        # Clean up empty rooms
+        if not room['senders'] and not room['receivers']:
+            del active_rooms[room_code]
 
 @socketio.on('join_room')
 def on_join(data):
     """Allow client to join with strict role separation"""
     room_code = data.get('code')
     device_type = data.get('type')  # 'sender' or 'receiver'
+    sid = request.sid
     
     if not room_code or not device_type:
+        emit('error', {'message': 'Invalid room code or device type'})
         return
-
-    # 1. Everyone joins the main room for status updates
-    join_room(room_code)
     
-    # 2. Receivers join a special listening room
-    if device_type == 'receiver':
+    # Initialize room if it doesn't exist
+    if room_code not in active_rooms:
+        active_rooms[room_code] = {'senders': [], 'receivers': []}
+    
+    room = active_rooms[room_code]
+    
+    # Add to appropriate list
+    if device_type == 'sender':
+        if sid not in room['senders']:
+            room['senders'].append(sid)
+        join_room(room_code)
+        print(f"📱 Sender {sid} joined room: {room_code}")
+    elif device_type == 'receiver':
+        if sid not in room['receivers']:
+            room['receivers'].append(sid)
+        join_room(room_code)
         join_room(f"{room_code}_recv")
-        print(f"🔊 Receiver joined room: {room_code}")
-    else:
-        print(f"📱 Sender joined room: {room_code}")
+        print(f"🔊 Receiver {sid} joined room: {room_code}")
     
-    # Notify others (e.g. tell Senders that a Receiver is online)
-    emit('room_joined', {'message': f'{device_type} connected', 'type': device_type}, to=room_code)
+    # Check if BOTH sender and receiver are present
+    has_sender = len(room['senders']) > 0
+    has_receiver = len(room['receivers']) > 0
+    room_active = has_sender and has_receiver
+    
+    # Send status to the joining client
+    emit('room_joined', {
+        'message': f'{device_type} joined',
+        'type': device_type,
+        'room_active': room_active,
+        'has_sender': has_sender,
+        'has_receiver': has_receiver
+    })
+    
+    # Notify others in the room if room becomes active
+    if room_active:
+        emit('room_status', {
+            'status': 'active',
+            'message': 'Both sender and receiver connected'
+        }, to=room_code, skip_sid=sid)
 
 @socketio.on('send_text')
 def handle_text(data):
@@ -55,11 +100,12 @@ def handle_text(data):
     text = data.get('text', '')
     
     if room_code and text:
-        print(f"Transmission to {room_code}: {text[:20]}...")
-        
-        # STRICT RULE: Only send to the Receiver sub-room
-        # Senders (who are not in this sub-room) will NOT get the message.
-        emit('receive_text', data, to=f"{room_code}_recv")
+        # Check if room exists and has receivers
+        if room_code in active_rooms and active_rooms[room_code]['receivers']:
+            print(f"Transmission to {room_code}: {text[:20]}...")
+            emit('receive_text', data, to=f"{room_code}_recv")
+        else:
+            emit('error', {'message': 'No receivers in room'})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
