@@ -30,17 +30,28 @@ def handle_disconnect():
     sid = request.sid
     print(f'Client disconnected: {sid}')
     
-    # Remove from all rooms
+    # Remove from all rooms and notify
     for room_code in list(active_rooms.keys()):
         room = active_rooms[room_code]
-        if sid in room.get('senders', []):
+        was_sender = sid in room.get('senders', [])
+        was_receiver = sid in room.get('receivers', [])
+        
+        if was_sender:
             room['senders'].remove(sid)
-        if sid in room.get('receivers', []):
+            # Notify receivers that sender left
+            if room.get('receivers'):
+                socketio.emit('room_status', {
+                    'status': 'sender_left',
+                    'message': 'Sender has left the room'
+                }, to=f"{room_code}_recv")
+        
+        if was_receiver:
             room['receivers'].remove(sid)
         
         # Clean up empty rooms
         if not room['senders'] and not room['receivers']:
             del active_rooms[room_code]
+            print(f"Room {room_code} deleted (empty)")
 
 @socketio.on('join_room')
 def on_join(data):
